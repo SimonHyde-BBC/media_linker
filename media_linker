@@ -1,0 +1,110 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use Linux::Inotify2;
+
+my $debug_flag = 0;
+
+sub debug
+{
+	print @_ if $debug_flag;
+}
+
+my $inotify = new Linux::Inotify2 || die "Unable to create inotify object: $!";
+$inotify->blocking(1);
+
+my $mask = IN_MODIFY | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF | IN_MOVED_TO;
+
+my $watcher = $inotify->watch("/media", $mask) || die "Failed to watch /media: $!";
+
+while(!-e "/media/pi")
+{
+	&debug("Waiting for /media/pi\n");
+	my @events = $inotify->read;
+	if($debug_flag)
+	{
+		&debug(sprintf("name: %s, mask: %d\n", $_->name, $_->mask)) foreach @events;
+	}
+}
+
+$watcher->cancel;
+&debug("Found /media/pi\n");
+
+my $dest_dir = "/media/pi";
+
+$watcher = $inotify->watch($dest_dir, $mask) || die "Failed to watch $dest_dir: $!";
+
+my $link_dir = "/linked_media";
+
+my %link;
+
+my %reverse;
+
+&debug("Reading old links\n");
+
+opendir(TARGETDIR,$link_dir) || die "Failed to open $link_dir: $!";
+
+while(my $old = readdir(TARGETDIR))
+{
+	next if $old eq '.' || $old eq '..';
+	my $name = "$link_dir/$old";
+	if(!-l $name)
+	{
+		unlink($name);
+		next;
+	}
+	my $target = readlink($name);
+	$link{$old} = $target;
+	$reverse{$target} = $old;
+}
+closedir(TARGETDIR);
+
+&check_names();
+
+while(1)
+{
+	&debug("waiting for events\n");
+	my @events = $inotify->read();
+	&debug("got events\n");
+	if($debug_flag)
+	{
+		&debug(sprintf("name: %s, mask: %d\n", $_->name, $_->mask)) foreach @events;
+	}
+	&check_names();
+}
+
+sub check_names
+{
+	opendir(DIR,$dest_dir) || die "Failed to open $dest_dir: $!";
+	my @names = grep{$_ ne '.' && $_ ne '..'} readdir(DIR);
+	&debug("Names is: @names\n");
+	my %this_pass = ();
+	foreach(@names)
+	{
+		my $target = "$dest_dir/$_";
+		$this_pass{$target} = 1;
+		next if(defined($reverse{$target}));
+		my $index = 0;
+		my $linkname = "card" . (++$index);
+		while(-e "$link_dir/$linkname" || -l "$link_dir/$linkname")
+		{
+			$linkname = "card" . (++$index);
+		}
+		&debug("Creating link $link_dir/$linkname to $target\n");
+		symlink($target, "$link_dir/$linkname") || warn("Failed to create symlink: $!");
+		$link{$linkname} = $target;
+		$reverse{$target} = $linkname;
+	}
+	my @old_links = keys(%link);
+	foreach my $linkname (@old_links)
+	{
+		my $target = $link{$linkname};
+		next if(defined($this_pass{$target}));
+		&debug("Deleting link $link_dir/$linkname\n");
+		unlink("$link_dir/$linkname") || warn ("Failed to delete old sy6mlink: $!");
+		delete($link{$linkname});
+		delete($reverse{$target});
+	}
+	closedir(DIR);
+}
